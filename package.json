@@ -8,6 +8,6 @@
   "dependencies": {
     "express": "^4.18.2",
     "cors": "^2.8.5",
-    "@supabase/supabase-client": "^2.39.0"
+    "@supabase/supabase-client": "git+https://github.com/supabase/supabase-js.git"
   }
 }
