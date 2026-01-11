@@ -1,5 +1,5 @@
 const express = require('express');
-const { createClient } = require('@supabase/supabase-client');
+const { createClient } = require('@supabase/supabase-js'); // Corrigido aqui
 const cors = require('cors');
 
 const app = express();
@@ -11,9 +11,9 @@ const supabase = createClient(supabaseUrl, supabaseKey);
 app.use(cors());
 app.use(express.json());
 
+// Rota Consultar
 app.get('/api/ia/consultar', async (req, res) => {
     const { data, funcionario_id } = req.query;
-    if (!data) return res.status(400).json({ error: "Data não informada." });
     try {
         const { data: horarios, error } = await supabase
             .from('agendamentos')
@@ -31,6 +31,7 @@ app.get('/api/ia/consultar', async (req, res) => {
     }
 });
 
+// Rota Agendar
 app.post('/api/ia/agendar', async (req, res) => {
     const { cliente_nome, cliente_telefone, data, horario_inicio, servico_id, funcionario_id } = req.body;
     try {
@@ -45,4 +46,4 @@ app.post('/api/ia/agendar', async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Servidor rodando na porta ${PORT}`));
+app.listen(PORT, () => console.log(`✅ Servidor rodando na porta ${PORT}`));
