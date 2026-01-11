@@ -1,5 +1,5 @@
 const express = require('express');
-const { createClient } = require('@supabase/supabase-js'); // Corrigido aqui
+const { createClient } = require('@supabase/supabase-js');
 const cors = require('cors');
 
 const app = express();
@@ -17,14 +17,18 @@ app.get('/api/ia/consultar', async (req, res) => {
     try {
         const { data: horarios, error } = await supabase
             .from('agendamentos')
-            .select('horario_inicio')
+            .select('hora_inicio') // Nome correto da coluna no banco
             .eq('data', data)
-            .eq('funcionario_id', funcionario_id);
+            .eq('profissional_id', funcionario_id); // Usando profissional_id conforme dump
 
         if (error) throw error;
+        
         const todos = ["08:00", "09:00", "10:00", "11:00", "12:00", "13:00", "14:00", "15:00", "16:00", "17:00", "18:00", "19:00", "20:00", "21:00"];
-        const ocupados = horarios.map(h => h.horario_inicio.substring(0, 5));
+        
+        // Formata as horas vindas do banco (ex: "10:00:00" -> "10:00")
+        const ocupados = horarios.map(h => h.hora_inicio.substring(0, 5));
         const disponiveis = todos.filter(h => !ocupados.includes(h));
+        
         res.status(200).json({ disponiveis });
     } catch (error) {
         res.status(500).json({ error: error.message });
@@ -36,7 +40,12 @@ app.post('/api/ia/agendar', async (req, res) => {
     const { cliente_nome, cliente_telefone, data, horario_inicio, servico_id, funcionario_id } = req.body;
     try {
         const { error } = await supabase.from('agendamentos').insert([{ 
-            cliente_nome, cliente_telefone, data, horario_inicio, servico_id, funcionario_id 
+            cliente_nome, 
+            cliente_telefone, 
+            data, 
+            hora_inicio: horario_inicio, // Mapeando para o nome correto
+            servico_id, 
+            profissional_id: funcionario_id // Mapeando para profissional_id
         }]);
         if (error) throw error;
         res.status(200).json({ success: true });
