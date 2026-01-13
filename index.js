@@ -18,7 +18,7 @@ app.use(express.text({ type: 'application/json' }));
 app.use((req, res, next) => {
     if (typeof req.body === 'string' && req.body.trim().startsWith('"')) {
         try {
-            // Remove aspas duplas externas e desescapa a string
+            // Remove aspas duplas externas e desescapa a string vinda da IA
             const cleaned = req.body.trim().replace(/^"+|"+$/g, '').replace(/\\"/g, '"');
             req.body = JSON.parse(cleaned);
         } catch (e) {
@@ -34,13 +34,19 @@ app.use((req, res, next) => {
 
 app.use(express.json());
 
-// CONSULTAR HORÁRIOS (POST ou GET)
+// CONFIGURAÇÃO: ID da Zona de Espera como padrão
+const ID_ZONA_ESPERA = 'f7ed71fa-4c8c-47f9-8ed6-7e92327f3f82';
+
+// CONSULTAR HORÁRIOS
 app.all('/api/ia/consultar', async (req, res) => {
     const dados = (req.method === 'POST') ? req.body : req.query;
-    const { data, funcionario_id } = dados;
+    
+    // Se a IA não enviar o ID, usamos a Zona de Espera automaticamente
+    const data = dados.data;
+    const funcionario_id = dados.funcionario_id || ID_ZONA_ESPERA;
 
-    if (!data || !funcionario_id) {
-        return res.status(400).json({ error: "Data e funcionario_id são obrigatórios." });
+    if (!data) {
+        return res.status(400).json({ error: "O campo 'data' é obrigatório." });
     }
 
     try {
@@ -57,6 +63,7 @@ app.all('/api/ia/consultar', async (req, res) => {
         const ocupados = horarios.map(h => h.hora_inicio.substring(0, 5));
         const disponiveis = todosHorarios.filter(h => !ocupados.includes(h));
 
+        // Retornamos os disponíveis para a IA informar ao cliente
         res.status(200).json({ disponiveis });
     } catch (error) {
         res.status(500).json({ error: error.message });
@@ -66,9 +73,15 @@ app.all('/api/ia/consultar', async (req, res) => {
 // AGENDAR SERVIÇO
 app.all('/api/ia/agendar', async (req, res) => {
     const dados = (req.method === 'POST') ? req.body : req.query;
-    const { cliente_nome, data, horario_inicio, servico_id, funcionario_id } = dados;
+    
+    const { cliente_nome, data, horario_inicio, servico_id } = dados;
+    const funcionario_id = dados.funcionario_id || ID_ZONA_ESPERA;
 
-    // Cálculo automático de hora_fim (horario_inicio + 1 hora) para evitar erro 500 no banco
+    if (!cliente_nome || !data || !horario_inicio) {
+        return res.status(400).json({ error: "Dados incompletos para agendamento." });
+    }
+
+    // Cálculo automático de hora_fim (horario_inicio + 1 hora)
     let [hora, minuto] = horario_inicio.split(':');
     let hora_fim = `${(parseInt(hora) + 1).toString().padStart(2, '0')}:${minuto}:00`;
 
@@ -80,14 +93,14 @@ app.all('/api/ia/agendar', async (req, res) => {
                 data, 
                 hora_inicio: `${horario_inicio}:00`, 
                 hora_fim: hora_fim,
-                servico_id, 
+                servico_id: servico_id || null, 
                 profissional_id: funcionario_id,
                 status: 'agendado',
                 origem: 'Nati IA'
             }]);
 
         if (error) throw error;
-        res.status(200).json({ success: true, message: 'Agendamento realizado!' });
+        res.status(200).json({ success: true, message: 'Agendamento realizado com sucesso!' });
     } catch (error) {
         res.status(500).json({ error: error.message });
     }
