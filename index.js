@@ -17,6 +17,117 @@ const calcularHoraFim = (horaInicio, duracaoMin) => {
     return `${horasFim.toString().padStart(2, '0')}:${minutosFim.toString().padStart(2, '0')}:00`;
 };
 
+// ===== FUNÇÕES AUXILIARES PARA VALIDAÇÃO =====
+
+// Busca profissionais humanos (exclui Zona de Espera)
+async function buscarProfissionaisHumanos() {
+    const { data, error } = await supabase
+        .from('profissionais')
+        .select('id, nome, ativo')
+        .neq('nome', 'Zona de Espera')
+        .neq('ativo', false)
+        .order('nome');
+    
+    if (error) throw error;
+    return data || [];
+}
+
+// Busca Zona de Espera
+async function buscarZonaEspera() {
+    const { data, error } = await supabase
+        .from('profissionais')
+        .select('id, nome')
+        .or('nome.ilike.%Zona de Espera%,nome.ilike.%Espera%')
+        .single();
+    
+    if (error) {
+        console.warn('Zona de Espera não encontrada:', error.message);
+        return null;
+    }
+    return data;
+}
+
+// Verifica disponibilidade real entre profissionais humanos
+async function verificarDisponibilidadeReal(data, horaInicio, servicoId) {
+    try {
+        // 1. Busca profissionais humanos
+        const profissionaisHumanos = await buscarProfissionaisHumanos();
+        
+        if (profissionaisHumanos.length === 0) {
+            throw new Error('Nenhum profissional humano encontrado');
+        }
+        
+        // 2. Busca duração do serviço
+        const { data: servico, error: servicoError } = await supabase
+            .from('servicos')
+            .select('duracao_min')
+            .eq('id', servicoId)
+            .single();
+        
+        if (servicoError) throw servicoError;
+        
+        const duracaoMin = servico.duracao_min || 60;
+        
+        // 3. Converte horários para minutos
+        const [hora, minuto] = horaInicio.split(':').map(Number);
+        const inicioMinutos = hora * 60 + minuto;
+        const fimMinutos = inicioMinutos + duracaoMin;
+        
+        // 4. Busca agendamentos do dia para profissionais humanos
+        const { data: agendamentos, error: agendaError } = await supabase
+            .from('agendamentos')
+            .select('profissional_id, hora_inicio, servico_id')
+            .eq('data', data)
+            .neq('status', 'cancelado')
+            .in('profissional_id', profissionaisHumanos.map(p => p.id));
+        
+        if (agendaError) throw agendaError;
+        
+        // 5. Verifica sobreposição
+        let profissionaisOcupados = new Set();
+        
+        for (const ag of agendamentos || []) {
+            const [agHora, agMin] = ag.hora_inicio.split(':').map(Number);
+            const agInicio = agHora * 60 + agMin;
+            
+            // Busca duração do serviço agendado
+            const { data: servicoAg, error: _ } = await supabase
+                .from('servicos')
+                .select('duracao_min')
+                .eq('id', ag.servico_id)
+                .single();
+            
+            const duracaoAg = servicoAg?.duracao_min || 60;
+            const agFim = agInicio + duracaoAg;
+            
+            // Verifica sobreposição
+            if (agInicio < fimMinutos && agFim > inicioMinutos) {
+                profissionaisOcupados.add(ag.profissional_id);
+            }
+        }
+        
+        // 6. Calcula vagas disponíveis
+        const vagasDisponiveis = profissionaisHumanos.length - profissionaisOcupados.size;
+        const todosOcupados = profissionaisOcupados.size >= profissionaisHumanos.length;
+        
+        console.log(`📊 Backend Validação: ${data} ${horaInicio} - Humanos: ${profissionaisHumanos.length}, Ocupados: ${profissionaisOcupados.size}, Vagas: ${vagasDisponiveis}, Disponível: ${!todosOcupados}`);
+        
+        return {
+            disponivel: !todosOcupados,
+            vagasDisponiveis,
+            profissionaisHumanos: profissionaisHumanos.map(p => p.nome),
+            profissionaisOcupados: Array.from(profissionaisOcupados),
+            todosOcupados
+        };
+        
+    } catch (error) {
+        console.error('Erro na validação de disponibilidade:', error);
+        throw error;
+    }
+}
+
+// ===== ENDPOINTS =====
+
 // CONSULTA DE HORÁRIOS
 app.get('/api/ia/consultar', async (req, res) => {
     const { data, funcionario_id } = req.query;
@@ -37,77 +148,184 @@ app.get('/api/ia/consultar', async (req, res) => {
     }
 });
 
-// AGENDAMENTO COM CRM E MARCAÇÃO DE IA
+// AGENDAMENTO COM VALIDAÇÃO DE DISPONIBILIDADE REAL
 app.post('/api/ia/agendar', async (req, res) => {
-    const { cliente_nome, cliente_telefone, data, horario_inicio, servico_id, funcionario_id } = req.body;
+    const { cliente_nome, cliente_telefone, data, horario_inicio, servico_id, funcionario_id, origem = 'Nati IA' } = req.body;
 
     try {
-        // 1. CRM: Buscar ou Criar Cliente
+        console.log(`📨 IA Tentando agendar: ${cliente_nome} para ${data} ${horario_inicio}`);
+        
+        // ===== 1. VERIFICA SE É ZONA DE ESPERA =====
+        const zonaEspera = await buscarZonaEspera();
+        
+        if (!zonaEspera) {
+            return res.status(400).json({ 
+                success: false, 
+                message: "Zona de Espera não configurada no sistema" 
+            });
+        }
+        
+        // Se a IA está tentando agendar diretamente em humano, REDIRECIONA para Zona de Espera
+        let profissionalAlvoId = funcionario_id;
+        if (funcionario_id !== zonaEspera.id) {
+            console.log(`🔄 IA redirecionando de ${funcionario_id} para Zona de Espera`);
+            profissionalAlvoId = zonaEspera.id;
+        }
+        
+        // ===== 2. VALIDA DISPONIBILIDADE REAL (ANTES DE QUALQUER AÇÃO) =====
+        const validacao = await verificarDisponibilidadeReal(data, horario_inicio, servico_id);
+        
+        if (!validacao.disponivel) {
+            return res.status(400).json({ 
+                success: false, 
+                message: `Horário indisponível - Todas as profissionais (${validacao.profissionaisHumanos.join(', ')}) estão ocupadas`,
+                detalhes: {
+                    profissionaisHumanos: validacao.profissionaisHumanos,
+                    vagasDisponiveis: validacao.vagasDisponiveis,
+                    todosOcupados: validacao.todosOcupados,
+                    horario: `${data} ${horario_inicio}`
+                },
+                codigo: 'CLINICA_LOTADA'
+            });
+        }
+        
+        console.log(`✅ Disponível! Vagas: ${validacao.vagasDisponiveis}/${validacao.profissionaisHumanos.length}`);
+        
+        // ===== 3. CRM: BUSCAR OU CRIAR CLIENTE =====
         let cliente_id;
-        const { data: clienteExistente } = await supabase
-            .from('clientes')
-            .select('id')
-            .eq('telefone', cliente_telefone)
-            .maybeSingle();
+        if (cliente_telefone) {
+            const { data: clienteExistente } = await supabase
+                .from('clientes')
+                .select('id')
+                .eq('telefone', cliente_telefone)
+                .maybeSingle();
 
-        if (clienteExistente) {
-            cliente_id = clienteExistente.id;
+            if (clienteExistente) {
+                cliente_id = clienteExistente.id;
+            } else {
+                const { data: novoC, error: errC } = await supabase
+                    .from('clientes')
+                    .insert([{ nome: cliente_nome, telefone: cliente_telefone }])
+                    .select()
+                    .single();
+                if (errC) throw errC;
+                cliente_id = novoC.id;
+            }
         } else {
+            // Cliente sem telefone (pode acontecer)
             const { data: novoC, error: errC } = await supabase
                 .from('clientes')
-                .insert([{ nome: cliente_nome, telefone: cliente_telefone }])
-                .select().single();
+                .insert([{ nome: cliente_nome }])
+                .select()
+                .single();
             if (errC) throw errC;
             cliente_id = novoC.id;
         }
-
-        // 2. BUSCAR DURAÇÃO REAL
-        const { data: servico } = await supabase
+        
+        // ===== 4. BUSCAR DURAÇÃO REAL =====
+        const { data: servico, error: servicoError } = await supabase
             .from('servicos')
-            .select('duracao_min')
+            .select('duracao_min, nome')
             .eq('id', servico_id)
             .single();
-
+        
+        if (servicoError) throw servicoError;
+        
         const hora_fim = calcularHoraFim(horario_inicio, servico.duracao_min);
-
-        // 3. TRAVA DE OVERBOOKING
+        
+        // ===== 5. TRAVA DE OVERBOOKING NA ZONA DE ESPERA =====
         const { data: ocupado } = await supabase
             .from('agendamentos')
             .select('id')
             .eq('data', data)
             .eq('hora_inicio', `${horario_inicio}:00`)
-            .eq('profissional_id', funcionario_id)
+            .eq('profissional_id', profissionalAlvoId)
             .neq('status', 'cancelado');
-
+        
         if (ocupado && ocupado.length > 0) {
-            return res.status(400).json({ success: false, message: "Horário já ocupado." });
+            return res.status(400).json({ 
+                success: false, 
+                message: "Este slot na Zona de Espera já está ocupado." 
+            });
         }
-
-        // 4. INSERT COM COLUNA 'origem'
-        const { error: errI } = await supabase
+        
+        // ===== 6. INSERT NA ZONA DE ESPERA COM ORIGEM IA =====
+        const { data: novoAgendamento, error: errI } = await supabase
             .from('agendamentos')
             .insert([{ 
-                cliente_id, cliente_nome, cliente_telefone, data, 
+                cliente_id, 
+                cliente_nome, 
+                cliente_telefone, 
+                data, 
                 hora_inicio: `${horario_inicio}:00`, 
                 hora_fim, 
                 servico_id, 
-                profissional_id: funcionario_id,
+                profissional_id: profissionalAlvoId,
                 status: 'agendado',
-                origem: 'Nati IA' // <-- Identificador para o frontend
-            }]);
-
+                origem: origem,
+                notas: `Criado pela Nati IA - Disponível para: ${validacao.profissionaisHumanos.join(', ')}`
+            }])
+            .select()
+            .single();
+        
         if (errI) throw errI;
-
+        
+        // ===== 7. RESPOSTA COM DETALHES =====
         res.status(200).json({ 
             success: true, 
-            message: `Agendamento realizado pela Nati!`,
-            professional: funcionario_id === '3a5b126a-d9d1-4195-8ce2-353feffb0a72' ? 'Nane' : 'Tati'
+            message: `Agendamento criado na Zona de Espera com sucesso!`,
+            detalhes: {
+                id: novoAgendamento.id,
+                cliente: cliente_nome,
+                data: data,
+                horario: horario_inicio,
+                servico: servico.nome,
+                profissional: 'Zona de Espera',
+                vagasDisponiveis: validacao.vagasDisponiveis,
+                profissionaisDisponiveis: validacao.profissionaisHumanos,
+                observacao: 'Aguardando redistribuição para profissional humano'
+            }
         });
+        
+        console.log(`🎯 IA Agendou: ${cliente_nome} na Zona de Espera (ID: ${novoAgendamento.id})`);
 
     } catch (error) {
-        res.status(500).json({ error: error.message });
+        console.error('❌ Erro no agendamento IA:', error);
+        res.status(500).json({ 
+            success: false, 
+            message: "Erro interno no agendamento",
+            erro: process.env.NODE_ENV === 'development' ? error.message : undefined
+        });
+    }
+});
+
+// ===== NOVO ENDPOINT: VERIFICAR DISPONIBILIDADE =====
+app.post('/api/ia/verificar-disponibilidade', async (req, res) => {
+    const { data, horario_inicio, servico_id } = req.body;
+    
+    try {
+        const validacao = await verificarDisponibilidadeReal(data, horario_inicio, servico_id);
+        
+        res.status(200).json({
+            success: true,
+            disponivel: validacao.disponivel,
+            vagasDisponiveis: validacao.vagasDisponiveis,
+            profissionaisHumanos: validacao.profissionaisHumanos,
+            profissionaisOcupados: validacao.profissionaisOcupados,
+            todosOcupados: validacao.todosOcupados,
+            mensagem: validacao.disponivel 
+                ? `Há ${validacao.vagasDisponiveis} vaga(s) disponível(is) entre ${validacao.profissionaisHumanos.join(', ')}`
+                : `Horário indisponível - Todas as profissionais (${validacao.profissionaisHumanos.join(', ')}) ocupadas`
+        });
+        
+    } catch (error) {
+        res.status(500).json({ 
+            success: false, 
+            message: "Erro ao verificar disponibilidade",
+            error: error.message 
+        });
     }
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🚀 Cronosflow v1.5 Online`));
+app.listen(PORT, () => console.log(`🚀 Cronosflow IA v2.0 Online - Com validação de disponibilidade real`));
